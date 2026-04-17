@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 — 2026-04-17
+
+Locked in Friday alignment meeting: BrentBot surfaces "no SF evidence" flags
+in the daily plan (not Penny UI only).
+
+### Added
+- `commitment_completed_no_evidence` webhook (Penny → BrentBot): fired once when
+  a commitment is marked completed with no prior `status_evidence` received.
+  BrentBot renders a daily plan flag: "Marked complete in Penny — no Salesforce
+  activity found. Verify with rep."
+- `CommitmentCompletedNoEvidencePayload` schema
+
+### Scope impact
+- Penny build ticket 2 (status_evidence receiver): also implements the
+  "no SF evidence" scheduled flag job that triggers this webhook
+- BrentBot ticket 3 (inbound webhook): adds receiver for
+  `commitment_completed_no_evidence` + daily plan rendering
+
 ## 0.2.0 — 2026-04-17
 
 Corrections and clarifications from Friday alignment review (Brent).

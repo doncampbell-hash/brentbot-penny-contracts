@@ -184,6 +184,48 @@ webhooks:
         '409':
           description: Duplicate idempotency_key. Already recorded — no-op.
 
+  commitment_completed_no_evidence:
+    post:
+      summary: "Penny → BrentBot: completed with no SF evidence"
+      description: |
+        Fired by Penny when a commitment is marked `completed` but Penny has never
+        received a `status_evidence` event for it.
+
+        BrentBot surfaces this in the morning daily plan Slack message so the
+        manager/rep can verify the work actually happened in Salesforce. The flag
+        is informational — it does not change the commitment's status.
+
+        **Penny fires this once per commitment**, when the `completed` transition
+        occurs and the evidence check returns empty. It does not re-fire on
+        subsequent evidence arrivals (those arrive via `status_evidence`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitmentCompletedNoEvidencePayload'
+            example:
+              event: commitment_completed_no_evidence
+              idempotency_key: "d4e5f6a7:b8c9d0e1f2a3"
+              trace_id: "550e8400-e29b-41d4-a716-446655440000"
+              sent_at: "2026-05-05T09:00:00Z"
+              penny_task_id: "task_9x8y7z6w"
+              brentbot_commitment_id: "7f3e2a1b-0c4d-4e5f-8a9b-1c2d3e4f5a6b"
+              rep_email: "alex.chen@acmecorp.com"
+              completed_at: "2026-05-04T17:30:00Z"
+              commitment_description: "Send written pricing proposal for 5,000-contractor package"
+      responses:
+        '200':
+          description: Flag received and queued for daily plan surfacing.
+        '404':
+          description: brentbot_commitment_id not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate idempotency_key. Already recorded — no-op.
+
   commitment_status_changed:
     post:
       summary: "Penny → BrentBot: commitment status transitioned"
@@ -461,6 +503,41 @@ components:
           type: string
           nullable: true
           description: Human-readable reason for the transition. Optional but encouraged for amber/red.
+
+    CommitmentCompletedNoEvidencePayload:
+      type: object
+      required: [event, idempotency_key, trace_id, sent_at, penny_task_id, brentbot_commitment_id, rep_email, completed_at, commitment_description]
+      properties:
+        event:
+          type: string
+          enum: [commitment_completed_no_evidence]
+        idempotency_key:
+          type: string
+        trace_id:
+          type: string
+          format: uuid
+        sent_at:
+          type: string
+          format: date-time
+        penny_task_id:
+          type: string
+        brentbot_commitment_id:
+          type: string
+          format: uuid
+          nullable: true
+        rep_email:
+          type: string
+          format: email
+          description: Lowercase work email of the rep. BrentBot uses this to route the daily plan flag.
+        completed_at:
+          type: string
+          format: date-time
+          description: When Penny recorded the completion (UTC). Authoritative.
+        commitment_description:
+          type: string
+          description: |
+            Human-readable commitment description. Included so BrentBot can render
+            the daily plan flag without a separate lookup.
 
     ErrorResponse:
       type: object
