@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 — 2026-04-17
+
+Corrections and clarifications from Friday alignment review (Brent).
+
+### Fixed
+- `meddpicc_field` enum: `identify_pain` → `identified_pain`
+- `CommitmentDetectedResponse.status` enum narrowed to `[green]` only in Phase 1; error path clarified (return 404, not amber, if rep unresolvable)
+
+### Added
+- Retry semantics documented in info description (5xx backoff, 4xx permanent failure, 404 queued retry)
+- Bidirectional rate limits (both directions capped at 10 req/sec)
+- `StatusEvidenceResponse` body for `status_evidence` 200 — includes `current_status` so BrentBot can detect a transition without a separate webhook round-trip
+- "No SF evidence" flag behavior documented in info description (Penny-side check; BrentBot surfaces separately via execution verification)
+- Phase 2 note on `evidence_type` enum (`calendar_event`, `email_activity` deferred)
+
+### Clarified
+- `opportunity_id` nullable with explanation: post-call notes can be account-scoped before an opportunity exists; SF Activity attaches to Account directly when null
+
 ## 0.1.0 — 2026-04-17
 
 Initial contract covering Phase 1 scope.

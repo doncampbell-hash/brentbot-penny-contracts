@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: BrentBot ↔ Penny Integration
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Webhook and REST contracts for the BrentBot ↔ Penny Phase 1 integration.
 
@@ -40,7 +40,23 @@ info:
     systems emit structured logs keyed on `trace_id`.
 
     ## Rate limits
-    BrentBot will not exceed 10 webhook requests/second to Penny.
+    - BrentBot → Penny: max 10 webhook requests/second
+    - Penny → BrentBot: max 10 webhook requests/second
+
+    ## Retry semantics
+    On 5xx or network timeout, senders retry with exponential backoff:
+    30s → 2m → 10m → 30m → alert after 24h with no success.
+    On 4xx (except 404 for `commitment_detected`), do not retry — treat as a
+    permanent failure and alert immediately.
+    On 404 for `commitment_detected`: BrentBot queues for retry (rep may not yet
+    exist in Penny); alert after 24h if still unresolvable.
+
+    ## "No SF evidence" flag (Penny-side behavior)
+    When a commitment is marked `completed` in Penny but Penny has never received
+    a `status_evidence` event for it, Penny may surface a "no Salesforce evidence"
+    flag in its UI. This is a Penny-internal check — BrentBot does not drive it.
+    BrentBot surfaces this pattern to managers separately via execution verification
+    ("trust the rep, but if it's not in Salesforce it didn't happen").
 
 webhooks:
 
@@ -54,6 +70,12 @@ webhooks:
         **Phase 1:** Only `audience: customer` + `category: deliverable` commitments
         are sent. The committer is set as the default owner, so every task arrives
         with an owner assigned — status starts Green on arrival.
+
+        **Error path for unresolvable rep:** If Penny cannot resolve `rep_email`
+        to a Penny user, return 404. BrentBot queues for retry. If still unresolvable
+        after 24h, BrentBot alerts for manual intervention. Penny should not return
+        a non-green status in Phase 1 — if the owner cannot be set, return 404
+        rather than creating an ownerless (amber) task.
       requestBody:
         required: true
         content:
@@ -101,7 +123,9 @@ webhooks:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: rep_email not found in Penny. BrentBot queues for retry.
+          description: |
+            rep_email not found in Penny. BrentBot queues for retry with
+            exponential backoff; alerts after 24h if unresolvable.
           content:
             application/json:
               schema:
@@ -121,6 +145,9 @@ webhooks:
         is already `completed` in Penny, the evidence is logged as corroboration only.
 
         Penny's timestamp wins if BrentBot and Penny disagree on timing.
+
+        **Phase 2 note:** `evidence_type` currently only supports `sf_activity`.
+        Phase 2 will add at minimum `calendar_event` and `email_activity`.
       requestBody:
         required: true
         content:
@@ -141,6 +168,13 @@ webhooks:
       responses:
         '200':
           description: Evidence recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusEvidenceResponse'
+              example:
+                recorded: true
+                current_status: amber
         '404':
           description: penny_task_id not found.
           content:
@@ -208,7 +242,6 @@ components:
         - audience
         - category
         - description
-        - due_date
         - idempotency_key
         - trace_id
       properties:
@@ -222,11 +255,14 @@ components:
           description: Lowercase work email of the rep who made the commitment. Canonical join key.
         account_id:
           type: string
-          description: Salesforce Account ID (18-char).
+          description: Salesforce Account ID (18-char). Always present — post-call notes are always account-scoped.
         opportunity_id:
           type: string
           nullable: true
-          description: Salesforce Opportunity ID (18-char), if known.
+          description: |
+            Salesforce Opportunity ID (18-char). Nullable — a commitment may arise from
+            an account-level conversation before an opportunity exists. When null,
+            BrentBot has attached the SF Activity to the Account directly.
         audience:
           type: string
           enum: [customer, internal]
@@ -254,7 +290,7 @@ components:
         meddpicc_field:
           type: string
           nullable: true
-          enum: [metrics, economic_buyer, decision_criteria, decision_process, identify_pain, champion, competition, null]
+          enum: [metrics, economic_buyer, decision_criteria, decision_process, identified_pain, champion, competition, null]
           description: Reserved for Phase 2. Always null in Phase 1.
         brentbot_recommendation_id:
           type: string
@@ -325,8 +361,10 @@ components:
           description: Penny's internal task ID. BrentBot stores this for future correlation.
         status:
           type: string
-          enum: [green, amber, red]
-          description: Initial RAG status. Always `green` for Phase 1 (owner assigned at creation).
+          enum: [green]
+          description: |
+            Initial RAG status. Always `green` in Phase 1 — if Penny cannot create the
+            task with an owner (e.g., rep_email unresolvable), return 404 instead.
 
     StatusEvidencePayload:
       type: object
@@ -353,6 +391,22 @@ components:
         evidence:
           $ref: '#/components/schemas/EvidenceRecord'
 
+    StatusEvidenceResponse:
+      type: object
+      required: [recorded]
+      properties:
+        recorded:
+          type: boolean
+        current_status:
+          type: string
+          nullable: true
+          enum: [green, amber, red, completed, cancelled, null]
+          description: |
+            Penny's current status for the commitment after recording the evidence.
+            Lets BrentBot detect a status transition without waiting for a
+            separate `commitment_status_changed` webhook. Null if Penny chose
+            not to transition (e.g., commitment already completed).
+
     EvidenceRecord:
       type: object
       required: [evidence_type, activity_id, timestamp]
@@ -360,7 +414,9 @@ components:
         evidence_type:
           type: string
           enum: [sf_activity]
-          description: Phase 1 only supports `sf_activity`. Additional types in Phase 2.
+          description: |
+            Phase 1 supports `sf_activity` only.
+            Phase 2 additions: `calendar_event`, `email_activity`.
         activity_id:
           type: string
           description: Salesforce Activity ID (Task or Event) that constitutes the evidence.
