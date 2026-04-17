@@ -1,0 +1,417 @@
+openapi: 3.1.0
+
+info:
+  title: BrentBot ↔ Penny Integration
+  version: 0.1.0
+  description: |
+    Webhook and REST contracts for the BrentBot ↔ Penny Phase 1 integration.
+
+    **Shared primitive:** A `Commitment` — a promise a sales rep makes to a customer,
+    extracted by BrentBot from post-call notes and tracked to completion by Penny.
+
+    **Phase 1 scope:** External customer deliverables only, detected from post-call
+    notes only. Internal, executive, and resource-allocation commitment types are
+    deferred to Phase 2.
+
+    ## Authentication
+
+    ### Webhooks (both directions)
+    HMAC-SHA256 signature in `X-Signature` header. Format: `sha256=<hex_digest>`.
+    The signed payload is `timestamp + "." + raw_body`. Timestamp is included in
+    the payload as `sent_at`. Reject payloads with `sent_at` older than 5 minutes.
+    Separate shared secrets per direction:
+    - BrentBot → Penny: `PENNY_OUTBOUND_SECRET` (held by BrentBot, verified by Penny)
+    - Penny → BrentBot: `PENNY_INBOUND_SECRET` (held by Penny, verified by BrentBot)
+
+    ### REST endpoints
+    `Authorization: Bearer <api_key>` header. One key per environment, rotatable.
+
+    ## Identity
+    `rep_email` (lowercase work email) is the canonical join key. Each system maps
+    it to its own internal user ID on receipt. Normalize to lowercase before comparison.
+
+    ## Idempotency
+    Every webhook payload includes an `idempotency_key`. Receivers must deduplicate
+    on `(source, idempotency_key)`. Return `200` for duplicate deliveries without
+    reprocessing.
+
+    ## Observability
+    All payloads include `trace_id` (UUID v4). Propagate across webhooks. Both
+    systems emit structured logs keyed on `trace_id`.
+
+    ## Rate limits
+    BrentBot will not exceed 10 webhook requests/second to Penny.
+
+webhooks:
+
+  commitment_detected:
+    post:
+      summary: "BrentBot → Penny: new commitment extracted"
+      description: |
+        Fired by BrentBot when a commitment is extracted from a post-call note.
+        Penny creates a task and returns its internal task ID.
+
+        **Phase 1:** Only `audience: customer` + `category: deliverable` commitments
+        are sent. The committer is set as the default owner, so every task arrives
+        with an owner assigned — status starts Green on arrival.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitmentDetectedPayload'
+            example:
+              event: commitment_detected
+              idempotency_key: "a1b2c3d4:e5f6a7b8c9d0"
+              trace_id: "550e8400-e29b-41d4-a716-446655440000"
+              sent_at: "2026-05-01T14:32:00Z"
+              commitment:
+                id: "7f3e2a1b-0c4d-4e5f-8a9b-1c2d3e4f5a6b"
+                rep_email: "alex.chen@acmecorp.com"
+                account_id: "001Dn00000AbCdEfG"
+                opportunity_id: "006Dn00000XyZaBc"
+                audience: customer
+                category: deliverable
+                description: "Send written pricing proposal for 5,000-contractor package"
+                committed_to: "Sarah Chen, VP Ops"
+                due_date: "2026-05-02T22:00:00Z"
+                due_date_local_display: "Friday, May 2 at 5:00 PM PT"
+                meddpicc_field: null
+                brentbot_recommendation_id: null
+                notify_committer: false
+                context:
+                  slack_message_url: null
+                  salesforce_activity_id: "00T1n00000AbCdEfG"
+                  brentbot_brief_url: null
+                  transcript_excerpt: "I'll get her a written pricing proposal by Friday"
+      responses:
+        '200':
+          description: Commitment received; task created in Penny.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitmentDetectedResponse'
+              example:
+                penny_task_id: "task_9x8y7z6w"
+                status: green
+        '400':
+          description: Malformed payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: rep_email not found in Penny. BrentBot queues for retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate idempotency_key. Already processed — no-op.
+
+  status_evidence:
+    post:
+      summary: "BrentBot → Penny: execution evidence found"
+      description: |
+        Fired by BrentBot when its nightly execution verification detects a
+        Salesforce activity that matches an open commitment.
+
+        Penny records the evidence on the commitment. Penny decides whether to
+        transition status — BrentBot does not assume any outcome. If the commitment
+        is already `completed` in Penny, the evidence is logged as corroboration only.
+
+        Penny's timestamp wins if BrentBot and Penny disagree on timing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusEvidencePayload'
+            example:
+              event: status_evidence
+              idempotency_key: "b2c3d4e5:f6a7b8c9d0e1"
+              trace_id: "550e8400-e29b-41d4-a716-446655440000"
+              sent_at: "2026-05-03T06:15:00Z"
+              penny_task_id: "task_9x8y7z6w"
+              brentbot_commitment_id: "7f3e2a1b-0c4d-4e5f-8a9b-1c2d3e4f5a6b"
+              evidence:
+                evidence_type: sf_activity
+                activity_id: "00T1n00000XyZaBcD"
+                timestamp: "2026-05-02T21:47:00Z"
+      responses:
+        '200':
+          description: Evidence recorded.
+        '404':
+          description: penny_task_id not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate idempotency_key. Already recorded — no-op.
+
+  commitment_status_changed:
+    post:
+      summary: "Penny → BrentBot: commitment status transitioned"
+      description: |
+        Fired by Penny when a commitment transitions status. BrentBot updates
+        its local `commitments.penny_status` and surfaces at-risk items in the
+        daily plan Slack message.
+
+        Penny is source of truth for status. BrentBot never initiates a status
+        change — it only reflects what Penny sends.
+
+        **RAG color semantics:**
+        - `green` — on track
+        - `amber` — at risk (due ≤ 3 days + no activity; or owner unassigned; or flagged)
+        - `red` — overdue, escalated, or explicitly flagged
+        - `completed` — rep fulfilled the commitment
+        - `cancelled` — commitment voided (created in error, opportunity dead, etc.)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitmentStatusChangedPayload'
+            example:
+              event: commitment_status_changed
+              idempotency_key: "c3d4e5f6:a7b8c9d0e1f2"
+              trace_id: "550e8400-e29b-41d4-a716-446655440000"
+              sent_at: "2026-05-02T18:00:00Z"
+              penny_task_id: "task_9x8y7z6w"
+              brentbot_commitment_id: "7f3e2a1b-0c4d-4e5f-8a9b-1c2d3e4f5a6b"
+              previous_status: green
+              new_status: amber
+              changed_at: "2026-05-02T18:00:00Z"
+              reason: "Due in 2 days, no activity logged"
+      responses:
+        '200':
+          description: Status update received and applied.
+        '404':
+          description: brentbot_commitment_id not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate idempotency_key. Already applied — no-op.
+
+components:
+  schemas:
+
+    Commitment:
+      type: object
+      required:
+        - id
+        - rep_email
+        - account_id
+        - audience
+        - category
+        - description
+        - due_date
+        - idempotency_key
+        - trace_id
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: BrentBot's internal commitment UUID.
+        rep_email:
+          type: string
+          format: email
+          description: Lowercase work email of the rep who made the commitment. Canonical join key.
+        account_id:
+          type: string
+          description: Salesforce Account ID (18-char).
+        opportunity_id:
+          type: string
+          nullable: true
+          description: Salesforce Opportunity ID (18-char), if known.
+        audience:
+          type: string
+          enum: [customer, internal]
+          description: Who the commitment was made to. Phase 1 sends `customer` only.
+        category:
+          type: string
+          enum: [deliverable, introduction, resource, decision, other]
+          description: What kind of commitment. Phase 1 sends `deliverable` only.
+        description:
+          type: string
+          description: One clear sentence describing what the rep committed to deliver.
+        committed_to:
+          type: string
+          nullable: true
+          description: Name and/or email of the customer contact this was promised to.
+        due_date:
+          type: string
+          format: date-time
+          nullable: true
+          description: UTC ISO 8601. Null if no specific deadline was stated.
+        due_date_local_display:
+          type: string
+          nullable: true
+          description: Pre-rendered display string in the rep's local timezone. E.g. "Friday, May 2 at 5:00 PM PT".
+        meddpicc_field:
+          type: string
+          nullable: true
+          enum: [metrics, economic_buyer, decision_criteria, decision_process, identify_pain, champion, competition, null]
+          description: Reserved for Phase 2. Always null in Phase 1.
+        brentbot_recommendation_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: If this commitment traces to a BrentBot recommendation, links them. Optional.
+        notify_committer:
+          type: boolean
+          default: false
+          description: |
+            If false, Penny suppresses its own notification to the rep. BrentBot owns
+            rep notifications for BB-detected commitments. Penny owns cross-functional
+            notifications (PreSales, Pro Services, etc.).
+        context:
+          $ref: '#/components/schemas/CommitmentContext'
+
+    CommitmentContext:
+      type: object
+      description: Source links and excerpt. All fields optional — populate what's available.
+      properties:
+        slack_message_url:
+          type: string
+          format: uri
+          nullable: true
+        salesforce_activity_id:
+          type: string
+          nullable: true
+          description: SF Activity (Task/Event) ID that triggered or corroborates this commitment.
+        brentbot_brief_url:
+          type: string
+          format: uri
+          nullable: true
+        transcript_excerpt:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: |
+            Short excerpt from the call notes or transcript that triggered this extraction.
+            Shown in Penny's task UI for context. Max 500 characters.
+
+    CommitmentDetectedPayload:
+      type: object
+      required: [event, idempotency_key, trace_id, sent_at, commitment]
+      properties:
+        event:
+          type: string
+          enum: [commitment_detected]
+        idempotency_key:
+          type: string
+          description: "Format: {brentbot_commitment_id}:{sha256(payload)}. Deduplication key."
+        trace_id:
+          type: string
+          format: uuid
+          description: Propagated across all webhooks for this commitment. Use in structured logs.
+        sent_at:
+          type: string
+          format: date-time
+          description: UTC timestamp of dispatch. Reject if > 5 minutes old.
+        commitment:
+          $ref: '#/components/schemas/Commitment'
+
+    CommitmentDetectedResponse:
+      type: object
+      required: [penny_task_id, status]
+      properties:
+        penny_task_id:
+          type: string
+          description: Penny's internal task ID. BrentBot stores this for future correlation.
+        status:
+          type: string
+          enum: [green, amber, red]
+          description: Initial RAG status. Always `green` for Phase 1 (owner assigned at creation).
+
+    StatusEvidencePayload:
+      type: object
+      required: [event, idempotency_key, trace_id, sent_at, penny_task_id, brentbot_commitment_id, evidence]
+      properties:
+        event:
+          type: string
+          enum: [status_evidence]
+        idempotency_key:
+          type: string
+        trace_id:
+          type: string
+          format: uuid
+        sent_at:
+          type: string
+          format: date-time
+        penny_task_id:
+          type: string
+          description: Penny's task ID for this commitment.
+        brentbot_commitment_id:
+          type: string
+          format: uuid
+          description: BrentBot's internal commitment UUID.
+        evidence:
+          $ref: '#/components/schemas/EvidenceRecord'
+
+    EvidenceRecord:
+      type: object
+      required: [evidence_type, activity_id, timestamp]
+      properties:
+        evidence_type:
+          type: string
+          enum: [sf_activity]
+          description: Phase 1 only supports `sf_activity`. Additional types in Phase 2.
+        activity_id:
+          type: string
+          description: Salesforce Activity ID (Task or Event) that constitutes the evidence.
+        timestamp:
+          type: string
+          format: date-time
+          description: When the SF activity occurred (UTC). Penny's timestamp wins for status transitions if there's a conflict.
+
+    CommitmentStatusChangedPayload:
+      type: object
+      required: [event, idempotency_key, trace_id, sent_at, penny_task_id, previous_status, new_status, changed_at]
+      properties:
+        event:
+          type: string
+          enum: [commitment_status_changed]
+        idempotency_key:
+          type: string
+        trace_id:
+          type: string
+          format: uuid
+        sent_at:
+          type: string
+          format: date-time
+        penny_task_id:
+          type: string
+        brentbot_commitment_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: BrentBot's UUID if known; may be null if Penny can't correlate.
+        previous_status:
+          type: string
+          enum: [green, amber, red, completed, cancelled]
+        new_status:
+          type: string
+          enum: [green, amber, red, completed, cancelled]
+        changed_at:
+          type: string
+          format: date-time
+          description: When Penny transitioned the status (UTC). Authoritative.
+        reason:
+          type: string
+          nullable: true
+          description: Human-readable reason for the transition. Optional but encouraged for amber/red.
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+          nullable: true
